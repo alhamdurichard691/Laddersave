@@ -1,4 +1,3 @@
-# Laddersave
 
 # 🪜 LadderSave - Incentivized Savings Contract
 
