@@ -15,10 +15,25 @@
 (define-constant ERR_MINIMUM_CONTRIBUTION (err u113))
 (define-constant ERR_INVALID_GROUP_SIZE (err u114))
 (define-constant ERR_CANNOT_LEAVE_GROUP (err u115))
+(define-constant ERR_PLAN_NOT_FOUND (err u116))
+(define-constant ERR_PLAN_PAUSED (err u117))
+(define-constant ERR_PLAN_NOT_DUE (err u118))
+(define-constant ERR_INVALID_FREQUENCY (err u119))
+(define-constant ERR_INVALID_TARGET (err u120))
+(define-constant ERR_PLAN_ALREADY_EXISTS (err u121))
+(define-constant ERR_CHALLENGE_NOT_FOUND (err u122))
+(define-constant ERR_CHALLENGE_ENDED (err u123))
+(define-constant ERR_CHALLENGE_NOT_ENDED (err u124))
+(define-constant ERR_ALREADY_JOINED_CHALLENGE (err u125))
+(define-constant ERR_CHALLENGE_FULL (err u126))
+(define-constant ERR_NOT_CHALLENGE_PARTICIPANT (err u127))
+(define-constant ERR_INVALID_DURATION (err u128))
 
 (define-data-var next-ladder-id uint u1)
 (define-data-var total-rewards-pool uint u0)
 (define-data-var next-group-id uint u1)
+(define-data-var next-plan-id uint u1)
+(define-data-var next-challenge-id uint u1)
 
 (define-map savings-ladders
   { ladder-id: uint }
@@ -83,6 +98,93 @@
 (define-map group-contribution-counter
   { group-id: uint }
   { next-contribution-id: uint }
+)
+
+(define-map automated-savings-plans
+  { plan-id: uint }
+  {
+    owner: principal,
+    target-type: (string-ascii 10),
+    target-id: uint,
+    amount: uint,
+    frequency-blocks: uint,
+    last-executed: uint,
+    next-execution: uint,
+    is-active: bool,
+    created-at: uint,
+    total-executions: uint,
+    streak-count: uint,
+    automation-bonus: uint
+  }
+)
+
+(define-map plan-execution-history
+  { plan-id: uint, execution-id: uint }
+  {
+    executed-at: uint,
+    amount: uint,
+    block-height: uint,
+    bonus-earned: uint
+  }
+)
+
+(define-map plan-execution-counter
+  { plan-id: uint }
+  { next-execution-id: uint }
+)
+
+(define-map user-plan-count
+  { user: principal }
+  { active-plans: uint, total-plans: uint }
+)
+
+(define-map savings-challenges
+  { challenge-id: uint }
+  {
+    creator: principal,
+    title: (string-ascii 50),
+    description: (string-ascii 200),
+    entry-fee: uint,
+    prize-pool: uint,
+    max-participants: uint,
+    current-participants: uint,
+    start-block: uint,
+    end-block: uint,
+    winner: (optional principal),
+    status: (string-ascii 20),
+    challenge-type: (string-ascii 20)
+  }
+)
+
+(define-map challenge-participants
+  { challenge-id: uint, participant: principal }
+  {
+    amount-saved: uint,
+    ladder-id: (optional uint),
+    group-id: (optional uint),
+    joined-at: uint,
+    prize-claimed: bool,
+    final-rank: uint
+  }
+)
+
+(define-map challenge-leaderboard
+  { challenge-id: uint, rank: uint }
+  {
+    participant: principal,
+    amount-saved: uint,
+    prize-percentage: uint
+  }
+)
+
+(define-map user-challenge-stats
+  { user: principal }
+  {
+    challenges-joined: uint,
+    challenges-won: uint,
+    total-prizes-won: uint,
+    best-rank: uint
+  }
 )
 
 (define-public (create-savings-ladder (target-amount uint) (milestone-count uint))
@@ -544,3 +646,518 @@
 (define-read-only (get-next-group-id)
   (var-get next-group-id)
 )
+
+(define-public (create-automated-plan (target-type (string-ascii 10)) (target-id uint) (amount uint) (frequency-blocks uint))
+  (let
+    (
+      (plan-id (var-get next-plan-id))
+      (user-count (default-to { active-plans: u0, total-plans: u0 } (map-get? user-plan-count { user: tx-sender })))
+    )
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (and (>= frequency-blocks u144) (<= frequency-blocks u4320)) ERR_INVALID_FREQUENCY)
+    (asserts! (or (is-eq target-type "ladder") (is-eq target-type "group")) ERR_INVALID_TARGET)
+    
+    (if (is-eq target-type "ladder")
+      (asserts! (is-some (map-get? savings-ladders { ladder-id: target-id })) ERR_LADDER_NOT_FOUND)
+      (asserts! (is-some (map-get? savings-groups { group-id: target-id })) ERR_GROUP_NOT_FOUND)
+    )
+    
+    (map-set automated-savings-plans
+      { plan-id: plan-id }
+      {
+        owner: tx-sender,
+        target-type: target-type,
+        target-id: target-id,
+        amount: amount,
+        frequency-blocks: frequency-blocks,
+        last-executed: u0,
+        next-execution: (+ stacks-block-height frequency-blocks),
+        is-active: true,
+        created-at: stacks-block-height,
+        total-executions: u0,
+        streak-count: u0,
+        automation-bonus: u0
+      }
+    )
+    
+    (map-set plan-execution-counter
+      { plan-id: plan-id }
+      { next-execution-id: u1 }
+    )
+    
+    (map-set user-plan-count
+      { user: tx-sender }
+      {
+        active-plans: (+ (get active-plans user-count) u1),
+        total-plans: (+ (get total-plans user-count) u1)
+      }
+    )
+    
+    (var-set next-plan-id (+ plan-id u1))
+    (ok plan-id)
+  )
+)
+
+(define-public (execute-automated-plan (plan-id uint))
+  (let
+    (
+      (plan (unwrap! (map-get? automated-savings-plans { plan-id: plan-id }) ERR_PLAN_NOT_FOUND))
+      (execution-counter (unwrap! (map-get? plan-execution-counter { plan-id: plan-id }) ERR_PLAN_NOT_FOUND))
+      (execution-id (get next-execution-id execution-counter))
+      (streak-bonus (calculate-automation-bonus (get streak-count plan)))
+      (total-amount (+ (get amount plan) streak-bonus))
+    )
+    (asserts! (get is-active plan) ERR_PLAN_PAUSED)
+    (asserts! (>= stacks-block-height (get next-execution plan)) ERR_PLAN_NOT_DUE)
+    
+    (try! (stx-transfer? total-amount tx-sender (as-contract tx-sender)))
+    
+    (if (is-eq (get target-type plan) "ladder")
+      (try! (deposit-to-ladder (get target-id plan) total-amount))
+      (try! (contribute-to-group (get target-id plan) total-amount))
+    )
+    
+    (map-set plan-execution-history
+      { plan-id: plan-id, execution-id: execution-id }
+      {
+        executed-at: stacks-block-height,
+        amount: total-amount,
+        block-height: stacks-block-height,
+        bonus-earned: streak-bonus
+      }
+    )
+    
+    (map-set plan-execution-counter
+      { plan-id: plan-id }
+      { next-execution-id: (+ execution-id u1) }
+    )
+    
+    (map-set automated-savings-plans
+      { plan-id: plan-id }
+      (merge plan {
+        last-executed: stacks-block-height,
+        next-execution: (+ stacks-block-height (get frequency-blocks plan)),
+        total-executions: (+ (get total-executions plan) u1),
+        streak-count: (+ (get streak-count plan) u1),
+        automation-bonus: (+ (get automation-bonus plan) streak-bonus)
+      })
+    )
+    
+    (ok total-amount)
+  )
+)
+
+(define-public (pause-automated-plan (plan-id uint))
+  (let
+    (
+      (plan (unwrap! (map-get? automated-savings-plans { plan-id: plan-id }) ERR_PLAN_NOT_FOUND))
+      (user-count (default-to { active-plans: u0, total-plans: u0 } (map-get? user-plan-count { user: tx-sender })))
+    )
+    (asserts! (is-eq tx-sender (get owner plan)) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-active plan) ERR_PLAN_PAUSED)
+    
+    (map-set automated-savings-plans
+      { plan-id: plan-id }
+      (merge plan { is-active: false })
+    )
+    
+    (map-set user-plan-count
+      { user: tx-sender }
+      (merge user-count { active-plans: (- (get active-plans user-count) u1) })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (resume-automated-plan (plan-id uint))
+  (let
+    (
+      (plan (unwrap! (map-get? automated-savings-plans { plan-id: plan-id }) ERR_PLAN_NOT_FOUND))
+      (user-count (default-to { active-plans: u0, total-plans: u0 } (map-get? user-plan-count { user: tx-sender })))
+    )
+    (asserts! (is-eq tx-sender (get owner plan)) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get is-active plan)) ERR_PLAN_ALREADY_EXISTS)
+    
+    (map-set automated-savings-plans
+      { plan-id: plan-id }
+      (merge plan {
+        is-active: true,
+        next-execution: (+ stacks-block-height (get frequency-blocks plan)),
+        streak-count: u0
+      })
+    )
+    
+    (map-set user-plan-count
+      { user: tx-sender }
+      (merge user-count { active-plans: (+ (get active-plans user-count) u1) })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (update-plan-amount (plan-id uint) (new-amount uint))
+  (let
+    (
+      (plan (unwrap! (map-get? automated-savings-plans { plan-id: plan-id }) ERR_PLAN_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get owner plan)) ERR_NOT_AUTHORIZED)
+    (asserts! (> new-amount u0) ERR_INVALID_AMOUNT)
+    
+    (map-set automated-savings-plans
+      { plan-id: plan-id }
+      (merge plan { amount: new-amount })
+    )
+    
+    (ok new-amount)
+  )
+)
+
+(define-public (delete-automated-plan (plan-id uint))
+  (let
+    (
+      (plan (unwrap! (map-get? automated-savings-plans { plan-id: plan-id }) ERR_PLAN_NOT_FOUND))
+      (user-count (default-to { active-plans: u0, total-plans: u0 } (map-get? user-plan-count { user: tx-sender })))
+    )
+    (asserts! (is-eq tx-sender (get owner plan)) ERR_NOT_AUTHORIZED)
+    
+    (map-delete automated-savings-plans { plan-id: plan-id })
+    
+    (if (get is-active plan)
+      (map-set user-plan-count
+        { user: tx-sender }
+        (merge user-count { active-plans: (- (get active-plans user-count) u1) })
+      )
+      true
+    )
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-automated-plan (plan-id uint))
+  (map-get? automated-savings-plans { plan-id: plan-id })
+)
+
+(define-read-only (get-plan-execution (plan-id uint) (execution-id uint))
+  (map-get? plan-execution-history { plan-id: plan-id, execution-id: execution-id })
+)
+
+(define-read-only (get-user-plan-stats (user principal))
+  (default-to { active-plans: u0, total-plans: u0 } (map-get? user-plan-count { user: user }))
+)
+
+(define-read-only (is-plan-ready-for-execution (plan-id uint))
+  (match (get-automated-plan plan-id)
+    plan (and 
+      (get is-active plan) 
+      (>= stacks-block-height (get next-execution plan))
+    )
+    false
+  )
+)
+
+(define-read-only (calculate-automation-bonus (streak-count uint))
+  (if (<= streak-count u5)
+    u0
+    (if (<= streak-count u10)
+      u1000
+      (if (<= streak-count u20)
+        u2500
+        u5000
+      )
+    )
+  )
+)
+
+(define-read-only (get-plan-status (plan-id uint))
+  (match (get-automated-plan plan-id)
+    plan (some {
+      is-active: (get is-active plan),
+      blocks-until-next: (if (>= stacks-block-height (get next-execution plan))
+        u0
+        (- (get next-execution plan) stacks-block-height)
+      ),
+      total-saved: (* (get total-executions plan) (get amount plan)),
+      bonus-earned: (get automation-bonus plan),
+      current-streak: (get streak-count plan)
+    })
+    none
+  )
+)
+
+(define-read-only (get-next-plan-id)
+  (var-get next-plan-id)
+)
+
+(define-public (create-savings-challenge (title (string-ascii 50)) (description (string-ascii 200)) (entry-fee uint) (max-participants uint) (duration-blocks uint) (challenge-type (string-ascii 20)))
+  (let
+    (
+      (challenge-id (var-get next-challenge-id))
+      (start-block (+ stacks-block-height u144))
+      (end-block (+ start-block duration-blocks))
+    )
+    (asserts! (> entry-fee u0) ERR_INVALID_AMOUNT)
+    (asserts! (and (>= max-participants u2) (<= max-participants u50)) ERR_INVALID_GROUP_SIZE)
+    (asserts! (and (>= duration-blocks u1440) (<= duration-blocks u43200)) ERR_INVALID_DURATION)
+    (asserts! (or (is-eq challenge-type "total-saved") (is-eq challenge-type "consistency")) ERR_INVALID_TARGET)
+    
+    (try! (stx-transfer? entry-fee tx-sender (as-contract tx-sender)))
+    
+    (map-set savings-challenges
+      { challenge-id: challenge-id }
+      {
+        creator: tx-sender,
+        title: title,
+        description: description,
+        entry-fee: entry-fee,
+        prize-pool: entry-fee,
+        max-participants: max-participants,
+        current-participants: u1,
+        start-block: start-block,
+        end-block: end-block,
+        winner: none,
+        status: "open",
+        challenge-type: challenge-type
+      }
+    )
+    
+    (map-set challenge-participants
+      { challenge-id: challenge-id, participant: tx-sender }
+      {
+        amount-saved: u0,
+        ladder-id: none,
+        group-id: none,
+        joined-at: stacks-block-height,
+        prize-claimed: false,
+        final-rank: u0
+      }
+    )
+    
+    (var-set next-challenge-id (+ challenge-id u1))
+    (ok challenge-id)
+  )
+)
+
+(define-public (join-savings-challenge (challenge-id uint) (target-type (string-ascii 10)) (target-id uint))
+  (let
+    (
+      (challenge (unwrap! (map-get? savings-challenges { challenge-id: challenge-id }) ERR_CHALLENGE_NOT_FOUND))
+      (participant-key { challenge-id: challenge-id, participant: tx-sender })
+      (user-stats (default-to { challenges-joined: u0, challenges-won: u0, total-prizes-won: u0, best-rank: u999 } (map-get? user-challenge-stats { user: tx-sender })))
+    )
+    (asserts! (is-none (map-get? challenge-participants participant-key)) ERR_ALREADY_JOINED_CHALLENGE)
+    (asserts! (is-eq (get status challenge) "open") ERR_CHALLENGE_ENDED)
+    (asserts! (< (get current-participants challenge) (get max-participants challenge)) ERR_CHALLENGE_FULL)
+    (asserts! (< stacks-block-height (get start-block challenge)) ERR_CHALLENGE_ENDED)
+    
+    (if (is-eq target-type "ladder")
+      (asserts! (is-some (map-get? savings-ladders { ladder-id: target-id })) ERR_LADDER_NOT_FOUND)
+      (if (is-eq target-type "group")
+        (asserts! (is-some (map-get? savings-groups { group-id: target-id })) ERR_GROUP_NOT_FOUND)
+        (asserts! false ERR_INVALID_TARGET)
+      )
+    )
+    
+    (try! (stx-transfer? (get entry-fee challenge) tx-sender (as-contract tx-sender)))
+    
+    (map-set challenge-participants
+      participant-key
+      {
+        amount-saved: u0,
+        ladder-id: (if (is-eq target-type "ladder") (some target-id) none),
+        group-id: (if (is-eq target-type "group") (some target-id) none),
+        joined-at: stacks-block-height,
+        prize-claimed: false,
+        final-rank: u0
+      }
+    )
+    
+    (map-set savings-challenges
+      { challenge-id: challenge-id }
+      (merge challenge {
+        current-participants: (+ (get current-participants challenge) u1),
+        prize-pool: (+ (get prize-pool challenge) (get entry-fee challenge))
+      })
+    )
+    
+    (map-set user-challenge-stats
+      { user: tx-sender }
+      (merge user-stats { challenges-joined: (+ (get challenges-joined user-stats) u1) })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (update-challenge-progress (challenge-id uint) (new-amount uint))
+  (let
+    (
+      (challenge (unwrap! (map-get? savings-challenges { challenge-id: challenge-id }) ERR_CHALLENGE_NOT_FOUND))
+      (participant-key { challenge-id: challenge-id, participant: tx-sender })
+      (participant (unwrap! (map-get? challenge-participants participant-key) ERR_NOT_CHALLENGE_PARTICIPANT))
+    )
+    (asserts! (is-eq (get status challenge) "active") ERR_CHALLENGE_ENDED)
+    (asserts! (and (>= stacks-block-height (get start-block challenge)) (< stacks-block-height (get end-block challenge))) ERR_CHALLENGE_ENDED)
+    (asserts! (> new-amount (get amount-saved participant)) ERR_INVALID_AMOUNT)
+    
+    (map-set challenge-participants
+      participant-key
+      (merge participant { amount-saved: new-amount })
+    )
+    
+    (ok new-amount)
+  )
+)
+
+(define-public (start-challenge (challenge-id uint))
+  (let
+    (
+      (challenge (unwrap! (map-get? savings-challenges { challenge-id: challenge-id }) ERR_CHALLENGE_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get creator challenge)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status challenge) "open") ERR_CHALLENGE_ENDED)
+    (asserts! (>= stacks-block-height (get start-block challenge)) ERR_CHALLENGE_NOT_ENDED)
+    
+    (map-set savings-challenges
+      { challenge-id: challenge-id }
+      (merge challenge { status: "active" })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (end-challenge (challenge-id uint))
+  (let
+    (
+      (challenge (unwrap! (map-get? savings-challenges { challenge-id: challenge-id }) ERR_CHALLENGE_NOT_FOUND))
+      (winner (get-challenge-winner challenge-id))
+    )
+    (asserts! (or (is-eq tx-sender (get creator challenge)) (>= stacks-block-height (get end-block challenge))) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status challenge) "active") ERR_CHALLENGE_ENDED)
+    
+    (map-set savings-challenges
+      { challenge-id: challenge-id }
+      (merge challenge {
+        status: "ended",
+        winner: winner
+      })
+    )
+    
+    (ok winner)
+  )
+)
+
+(define-public (claim-challenge-prize (challenge-id uint))
+  (let
+    (
+      (challenge (unwrap! (map-get? savings-challenges { challenge-id: challenge-id }) ERR_CHALLENGE_NOT_FOUND))
+      (participant-key { challenge-id: challenge-id, participant: tx-sender })
+      (participant (unwrap! (map-get? challenge-participants participant-key) ERR_NOT_CHALLENGE_PARTICIPANT))
+      (prize-amount (calculate-prize-amount challenge-id tx-sender))
+      (user-stats (default-to { challenges-joined: u0, challenges-won: u0, total-prizes-won: u0, best-rank: u999 } (map-get? user-challenge-stats { user: tx-sender })))
+    )
+    (asserts! (is-eq (get status challenge) "ended") ERR_CHALLENGE_NOT_ENDED)
+    (asserts! (not (get prize-claimed participant)) ERR_ALREADY_CLAIMED)
+    (asserts! (> prize-amount u0) ERR_INSUFFICIENT_BALANCE)
+    
+    (try! (as-contract (stx-transfer? prize-amount tx-sender tx-sender)))
+    
+    (map-set challenge-participants
+      participant-key
+      (merge participant { prize-claimed: true })
+    )
+    
+    (map-set user-challenge-stats
+      { user: tx-sender }
+      (merge user-stats {
+        total-prizes-won: (+ (get total-prizes-won user-stats) prize-amount),
+        challenges-won: (if (is-eq (some tx-sender) (get winner challenge))
+          (+ (get challenges-won user-stats) u1)
+          (get challenges-won user-stats)
+        )
+      })
+    )
+    
+    (ok prize-amount)
+  )
+)
+
+(define-read-only (get-challenge-details (challenge-id uint))
+  (map-get? savings-challenges { challenge-id: challenge-id })
+)
+
+(define-read-only (get-challenge-participant (challenge-id uint) (participant principal))
+  (map-get? challenge-participants { challenge-id: challenge-id, participant: participant })
+)
+
+(define-read-only (get-user-challenge-stats (user principal))
+  (default-to { challenges-joined: u0, challenges-won: u0, total-prizes-won: u0, best-rank: u999 } (map-get? user-challenge-stats { user: user }))
+)
+
+(define-read-only (get-challenge-winner (challenge-id uint))
+  (let
+    (
+      (challenge (unwrap! (map-get? savings-challenges { challenge-id: challenge-id }) none))
+      (max-saved u0)
+      (winner none)
+    )
+    (if (is-eq (get status challenge) "ended")
+      (get winner challenge)
+      none
+    )
+  )
+)
+
+(define-read-only (calculate-prize-amount (challenge-id uint) (participant principal))
+  (match (get-challenge-details challenge-id)
+    challenge (match (get-challenge-participant challenge-id participant)
+      participant-data (let
+        (
+          (total-pool (get prize-pool challenge))
+          (is-winner (is-eq (some participant) (get winner challenge)))
+          (winner-prize (/ (* total-pool u70) u100))
+          (runner-up-prize (/ (* total-pool u20) u100))
+          (third-prize (/ (* total-pool u10) u100))
+        )
+        (if is-winner
+          winner-prize
+          (if (is-eq (get final-rank participant-data) u2)
+            runner-up-prize
+            (if (is-eq (get final-rank participant-data) u3)
+              third-prize
+              u0
+            )
+          )
+        )
+      )
+      u0
+    )
+    u0
+  )
+)
+
+(define-read-only (get-challenge-status (challenge-id uint))
+  (match (get-challenge-details challenge-id)
+    challenge (some {
+      is-active: (is-eq (get status challenge) "active"),
+      blocks-remaining: (if (> (get end-block challenge) stacks-block-height)
+        (- (get end-block challenge) stacks-block-height)
+        u0
+      ),
+      participants-count: (get current-participants challenge),
+      slots-available: (- (get max-participants challenge) (get current-participants challenge)),
+      prize-pool: (get prize-pool challenge)
+    })
+    none
+  )
+)
+
+(define-read-only (get-next-challenge-id)
+  (var-get next-challenge-id)
+)
+
+
+
